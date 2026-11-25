@@ -5,6 +5,10 @@
  */
 const parse_xml = (xml) => {
 	let pos = 0;
+	const assert_progress = (start) => {
+		if (pos <= start)
+			throw new Error(`invalid XML: parser made no progress at position ${pos}`);
+	};
 
 	const skip_whitespace = () => {
 		while (pos < xml.length && /\s/.test(xml[pos]))
@@ -28,6 +32,7 @@ const parse_xml = (xml) => {
 			if (xml[pos] === '>' || xml[pos] === '/' || xml[pos] === '?')
 				break;
 
+			const start = pos;
 			const name_start = pos;
 			while (pos < xml.length && /[a-zA-Z0-9_:.-]/.test(xml[pos]))
 				pos++;
@@ -52,6 +57,8 @@ const parse_xml = (xml) => {
 
 				attrs[`@_${name}`] = value;
 			}
+
+			assert_progress(start);
 		}
 
 		return attrs;
@@ -109,9 +116,12 @@ const parse_xml = (xml) => {
 			if (xml[pos] === '<' && xml[pos + 1] === '/')
 				break;
 
+			const start = pos;
 			const child = parse_node();
 			if (child)
 				children.push(child);
+
+			assert_progress(start);
 		}
 
 		// skip closing tag
@@ -158,10 +168,13 @@ const parse_xml = (xml) => {
 	const root = {};
 
 	while (pos < xml.length) {
+		const start = pos;
 		const node = parse_node();
 
 		if (node)
 			root[node.tag] = build_object(node);
+
+		assert_progress(start);
 	}
 
 	return root;
