@@ -16,6 +16,78 @@ const log = require('./log');
 let updateManifest;
 
 /**
+ * Resolve a portable update-manifest path beneath a local root.
+ * @param {string} root Local directory that must contain the resolved path.
+ * @param {string} file Portable relative path from the update manifest.
+ * @returns {string}
+ */
+const resolveUpdatePath = (root, file) => {
+	assert(typeof file === 'string' && file.length > 0, 'Update manifest contains an invalid file path');
+
+	const segments = file.split('/');
+	const isCanonical = !file.includes('\\')
+		&& !file.includes('\0')
+		&& !path.posix.isAbsolute(file)
+		&& !path.win32.isAbsolute(file)
+		&& path.posix.normalize(file) === file
+		&& segments.every(segment => segment.length > 0
+			&& segment !== '.'
+			&& segment !== '..'
+			&& !segment.includes(':')
+			&& !/[. ]$/.test(segment));
+	assert(isCanonical, 'Update manifest contains an unsafe file path: ' + file);
+
+	const resolvedRoot = path.resolve(root);
+	const resolvedPath = path.resolve(resolvedRoot, ...segments);
+	const relativePath = path.relative(resolvedRoot, resolvedPath);
+	const isContained = relativePath.length > 0
+		&& relativePath !== '..'
+		&& !relativePath.startsWith('..' + path.sep)
+		&& !path.isAbsolute(relativePath);
+	assert(isContained, 'Update manifest file path escapes the update root: ' + file);
+
+	return resolvedPath;
+};
+
+/**
+ * Ensure existing path components do not resolve outside of a local root.
+ * @param {string} root Local directory that must contain the target.
+ * @param {string} target Previously resolved target path.
+ */
+const assertUpdatePathContained = async (root, target) => {
+	const resolvedRoot = path.resolve(root);
+	const relativePath = path.relative(resolvedRoot, target);
+	assert(relativePath.length > 0
+		&& relativePath !== '..'
+		&& !relativePath.startsWith('..' + path.sep)
+		&& !path.isAbsolute(relativePath), 'Update path escapes its root');
+
+	const rootStats = await fsp.lstat(resolvedRoot);
+	assert(!rootStats.isSymbolicLink(), 'Update root cannot be a symbolic link');
+	const realRoot = await fsp.realpath(resolvedRoot);
+
+	let currentPath = resolvedRoot;
+	for (const segment of relativePath.split(path.sep)) {
+		currentPath = path.join(currentPath, segment);
+
+		try {
+			await fsp.lstat(currentPath);
+		} catch (e) {
+			if (e.code === 'ENOENT')
+				return;
+
+			throw e;
+		}
+
+		const realPath = await fsp.realpath(currentPath);
+		const realRelativePath = path.relative(realRoot, realPath);
+		assert(realRelativePath !== '..'
+			&& !realRelativePath.startsWith('..' + path.sep)
+			&& !path.isAbsolute(realRelativePath), 'Update path resolves outside its root');
+	}
+};
+
+/**
  * Check if there are any available updates.
  * Returns a Promise that resolves to true if an update is available.
  */
@@ -28,7 +100,13 @@ const checkForUpdates = async () => {
 		const manifest = await generics.getJSON(manifestURL);
 
 		assert(typeof manifest.guid === 'string', 'Update manifest does not contain a valid build GUID');
-		assert(typeof manifest.contents === 'object', 'Update manifest does not contain a valid contents list');
+		assert(manifest.contents !== null && typeof manifest.contents === 'object' && !Array.isArray(manifest.contents),
+			'Update manifest does not contain a valid contents list');
+
+		for (const file of Object.keys(manifest.contents)) {
+			resolveUpdatePath(constants.UPDATE.ROOT, file);
+			resolveUpdatePath(constants.UPDATE.DIRECTORY, file);
+		}
 
 		if (manifest.guid !== localManifest.guid) {
 			updateManifest = manifest;
@@ -48,7 +126,12 @@ const checkForUpdates = async () => {
  * Apply an outstanding update.
  */
 const applyUpdate = async () => {
-	const entries = Object.entries(updateManifest.contents);
+	const entries = Object.entries(updateManifest.contents).map(([file, meta]) => ({
+		file,
+		meta,
+		localPath: resolveUpdatePath(constants.UPDATE.ROOT, file),
+		updatePath: resolveUpdatePath(constants.UPDATE.DIRECTORY, file)
+	}));
 	core.showLoadingScreen(entries.length, 'Verifying local files...');
 
 	log.write('Starting update to %s...', updateManifest.guid);
@@ -56,12 +139,11 @@ const applyUpdate = async () => {
 	const requiredFiles = [];
 
 	for (let i = 0, n = entries.length; i < n; i++) {
-		const [file, meta] = entries[i];
+		const node = entries[i];
+		const { file, meta, localPath } = node;
 
 		await core.progressLoadingScreen((i + 1) + ' / ' + n);
-
-		const localPath = path.join(constants.UPDATE.ROOT, file);
-		const node = { file, meta };
+		await assertUpdatePathContained(constants.UPDATE.ROOT, localPath);
 
 		try {
 			log.write('Verifying local file: %s', file);
@@ -100,7 +182,11 @@ const applyUpdate = async () => {
 
 	// Create .update directory here and then check if it exists and is writeable. If not, we can't continue.
 	try{
+		await assertUpdatePathContained(constants.UPDATE.ROOT, constants.UPDATE.DIRECTORY);
 		await generics.createDirectory(constants.UPDATE.DIRECTORY);
+		await assertUpdatePathContained(constants.UPDATE.ROOT, constants.UPDATE.DIRECTORY);
+		const updateStats = await fsp.lstat(constants.UPDATE.DIRECTORY);
+		assert(updateStats.isDirectory() && !updateStats.isSymbolicLink(), '.update path is not a safe directory');
 		if(!await generics.directoryIsWritable(constants.UPDATE.DIRECTORY)) {
 			throw new Error('.update directory does not exist or is not writable');
 		}
@@ -113,10 +199,11 @@ const applyUpdate = async () => {
 	const remoteEndpoint = util.format(core.view.config.updateURL, nw.App.manifest.flavour) + 'update';
 	for (let i = 0, n = requiredFiles.length; i < n; i++) {
 		const node = requiredFiles[i];
-		const localFile = path.join(constants.UPDATE.DIRECTORY, node.file);
+		const localFile = node.updatePath;
 		log.write('Downloading %s to %s', node.file, localFile);
 
 		await core.progressLoadingScreen(util.format('%d / %d (%s)', i + 1, n, downloadSize));
+		await assertUpdatePathContained(constants.UPDATE.DIRECTORY, localFile);
 		await generics.downloadFile(remoteEndpoint, localFile, node.meta.ofs, node.meta.compSize, true, node.meta.permissions);
 	}
 
