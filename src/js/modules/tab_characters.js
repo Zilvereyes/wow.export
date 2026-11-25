@@ -1450,6 +1450,49 @@ function generate_character_id() {
 	return Math.floor(10000 + Math.random() * 90000).toString();
 }
 
+async function generate_unique_character_id(core, dir) {
+	const existing_ids = new Set(core.view.chrSavedCharacters.map(character => character.id));
+	const files = await fsp.readdir(dir);
+
+	for (const file of files) {
+		const match = file.match(/(\d{5})\.(?:json|png)$/);
+		if (match)
+			existing_ids.add(match[1]);
+	}
+
+	let id = generate_character_id();
+	while (existing_ids.has(id))
+		id = generate_character_id();
+
+	return id;
+}
+
+function is_valid_character_name(name) {
+	if (typeof name !== 'string')
+		return false;
+
+	const trimmed_name = name.trim();
+	if (trimmed_name.length === 0 || trimmed_name === '.' || trimmed_name === '..')
+		return false;
+
+	if (/[/\\\u0000-\u001F\u007F-\u009F]/.test(name) || /^[A-Za-z]:/.test(trimmed_name))
+		return false;
+
+	return !/^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\.|$)/i.test(trimmed_name);
+}
+
+function get_character_storage_path(dir, file_name) {
+	if (typeof file_name !== 'string' || file_name.length === 0 || path.basename(file_name) !== file_name)
+		throw new Error('Invalid character storage path.');
+
+	const resolved_dir = path.resolve(dir);
+	const resolved_path = path.resolve(resolved_dir, file_name);
+	if (path.dirname(resolved_path) !== resolved_dir)
+		throw new Error('Invalid character storage path.');
+
+	return resolved_path;
+}
+
 async function load_saved_characters(core) {
 	const dir = get_saved_characters_dir(core);
 	core.view.chrSavedCharacters = [];
@@ -1467,13 +1510,37 @@ async function load_saved_characters(core) {
 		if (!file.endsWith('.json'))
 			continue;
 
-		const match = file.match(/^(.+)-(\d{5})\.json$/);
-		if (!match)
+		const opaque_match = file.match(/^(\d{5})\.json$/);
+		const legacy_match = file.match(/^(.+)-(\d{5})\.json$/);
+		if (!opaque_match && !legacy_match)
 			continue;
 
-		const name = match[1];
-		const id = match[2];
-		const thumb_path = path.join(dir, `${name}-${id}.png`);
+		let name;
+		let id;
+		let thumb_file_name;
+
+		if (opaque_match) {
+			id = opaque_match[1];
+			thumb_file_name = `${id}.png`;
+
+			try {
+				const json_path = get_character_storage_path(dir, file);
+				const data = JSON.parse(await fsp.readFile(json_path, 'utf8'));
+				if (!is_valid_character_name(data.name))
+					continue;
+
+				name = data.name;
+			} catch (e) {
+				log.write('failed to read saved character metadata: %s', e.message);
+				continue;
+			}
+		} else {
+			name = legacy_match[1];
+			id = legacy_match[2];
+			thumb_file_name = `${name}-${id}.png`;
+		}
+
+		const thumb_path = get_character_storage_path(dir, thumb_file_name);
 
 		let thumb_data = null;
 		try {
@@ -1484,31 +1551,31 @@ async function load_saved_characters(core) {
 			// no thumbnail
 		}
 
-		characters.push({ name, id, thumb: thumb_data, file_name: file });
+		characters.push({ name, id, thumb: thumb_data, file_name: file, thumb_file_name });
 	}
 
 	core.view.chrSavedCharacters = characters;
 }
 
 async function save_character(core, name, thumb_data) {
+	if (!is_valid_character_name(name))
+		throw new Error('Invalid character name.');
+
 	const dir = get_saved_characters_dir(core);
 	await generics.createDirectory(dir);
 
-	// generate unique id
-	let id = generate_character_id();
-	const existing_ids = core.view.chrSavedCharacters.map(c => c.id);
-	while (existing_ids.includes(id))
-		id = generate_character_id();
+	const id = await generate_unique_character_id(core, dir);
 
 	// gather character data
 	const data = get_current_character_data(core);
+	data.name = name;
 
-	const json_path = path.join(dir, `${name}-${id}.json`);
+	const json_path = get_character_storage_path(dir, `${id}.json`);
 	await fsp.writeFile(json_path, JSON.stringify(data, null, '\t'));
 
 	// save thumbnail if provided
 	if (thumb_data) {
-		const thumb_path = path.join(dir, `${name}-${id}.png`);
+		const thumb_path = get_character_storage_path(dir, `${id}.png`);
 		const base64 = thumb_data.split(',')[1];
 		const buffer = Buffer.from(base64, 'base64');
 		await fsp.writeFile(thumb_path, buffer);
@@ -1520,8 +1587,8 @@ async function save_character(core, name, thumb_data) {
 
 async function delete_character(core, character) {
 	const dir = get_saved_characters_dir(core);
-	const json_path = path.join(dir, character.file_name);
-	const thumb_path = path.join(dir, `${character.name}-${character.id}.png`);
+	const json_path = get_character_storage_path(dir, character.file_name);
+	const thumb_path = get_character_storage_path(dir, character.thumb_file_name);
 
 	try {
 		await fsp.unlink(json_path);
@@ -1544,7 +1611,7 @@ async function delete_character(core, character) {
 
 async function load_character(core, character) {
 	const dir = get_saved_characters_dir(core);
-	const json_path = path.join(dir, character.file_name);
+	const json_path = get_character_storage_path(dir, character.file_name);
 
 	try {
 		const content = await fsp.readFile(json_path, 'utf8');
@@ -1734,7 +1801,7 @@ async function export_json_character(core) {
 
 async function export_saved_character(core, character) {
 	const dir = get_saved_characters_dir(core);
-	const json_path = path.join(dir, character.file_name);
+	const json_path = get_character_storage_path(dir, character.file_name);
 
 	let data;
 	try {
@@ -1806,17 +1873,20 @@ async function import_json_character(core, save_to_my_characters) {
 					name = path.basename(file_path, '.json');
 				}
 
+				if (!is_valid_character_name(name)) {
+					core.setToast('error', 'Invalid character file: name contains reserved path syntax.', null, -1);
+					return;
+				}
+
 				const dir = get_saved_characters_dir(core);
 				await generics.createDirectory(dir);
 
-				let id = generate_character_id();
-				const existing_ids = core.view.chrSavedCharacters.map(c => c.id);
-				while (existing_ids.includes(id))
-					id = generate_character_id();
+				const id = await generate_unique_character_id(core, dir);
 
-				// remove name/thumb from data before saving (stored separately)
+				// store the display name as metadata, never as part of a storage path
 				const save_data = {
 					version: 2,
+					name,
 					race_id: data.race_id,
 					model_id: data.model_id,
 					choices: data.choices || [],
@@ -1826,12 +1896,12 @@ async function import_json_character(core, save_to_my_characters) {
 				if (Object.keys(equipment_skins).length > 0)
 					save_data.equipment_skins = equipment_skins;
 
-				const save_path = path.join(dir, `${name}-${id}.json`);
+				const save_path = get_character_storage_path(dir, `${id}.json`);
 				await fsp.writeFile(save_path, JSON.stringify(save_data, null, '\t'));
 
 				// save thumbnail if provided
 				if (data.thumb) {
-					const thumb_path = path.join(dir, `${name}-${id}.png`);
+					const thumb_path = get_character_storage_path(dir, `${id}.png`);
 					const base64 = data.thumb.split(',')[1];
 					const buffer = Buffer.from(base64, 'base64');
 					await fsp.writeFile(thumb_path, buffer);
@@ -2631,6 +2701,11 @@ module.exports = {
 			const name = this.$core.view.chrSaveCharacterName.trim();
 			if (!name) {
 				this.$core.setToast('error', 'Please enter a character name.', null, 3000);
+				return;
+			}
+
+			if (!is_valid_character_name(name)) {
+				this.$core.setToast('error', 'Character names cannot contain reserved path syntax.', null, 3000);
 				return;
 			}
 
