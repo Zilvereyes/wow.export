@@ -34,6 +34,73 @@ function log (message, ...params) {
 	console.log(out);
 }
 
+function resolve_update_path(root, file) {
+	if (typeof file !== 'string' || file.length === 0)
+		throw new Error('Update contains an invalid file path.');
+
+	const segments = file.split('/');
+	const is_canonical = !file.includes('\\')
+		&& !file.includes('\0')
+		&& !path.posix.isAbsolute(file)
+		&& !path.win32.isAbsolute(file)
+		&& path.posix.normalize(file) === file
+		&& segments.every(segment => segment.length > 0
+			&& segment !== '.'
+			&& segment !== '..'
+			&& !segment.includes(':')
+			&& !/[. ]$/.test(segment));
+	if (!is_canonical)
+		throw new Error('Update contains an unsafe file path: ' + file);
+
+	const resolved_root = path.resolve(root);
+	const resolved_path = path.resolve(resolved_root, ...segments);
+	const relative_path = path.relative(resolved_root, resolved_path);
+	const is_contained = relative_path.length > 0
+		&& relative_path !== '..'
+		&& !relative_path.startsWith('..' + path.sep)
+		&& !path.isAbsolute(relative_path);
+	if (!is_contained)
+		throw new Error('Update file path escapes the update root: ' + file);
+
+	return resolved_path;
+}
+
+async function assert_update_path_contained(root, target) {
+	const resolved_root = path.resolve(root);
+	const relative_path = path.relative(resolved_root, target);
+	if (relative_path.length === 0
+		|| relative_path === '..'
+		|| relative_path.startsWith('..' + path.sep)
+		|| path.isAbsolute(relative_path))
+		throw new Error('Update path escapes its root.');
+
+	const root_stats = await fsp.lstat(resolved_root);
+	if (root_stats.isSymbolicLink())
+		throw new Error('Update root cannot be a symbolic link.');
+
+	const real_root = await fsp.realpath(resolved_root);
+	let current_path = resolved_root;
+	for (const segment of relative_path.split(path.sep)) {
+		current_path = path.join(current_path, segment);
+
+		try {
+			await fsp.lstat(current_path);
+		} catch (e) {
+			if (e.code === 'ENOENT')
+				return;
+
+			throw e;
+		}
+
+		const real_path = await fsp.realpath(current_path);
+		const real_relative_path = path.relative(real_root, real_path);
+		if (real_relative_path === '..'
+			|| real_relative_path.startsWith('..' + path.sep)
+			|| path.isAbsolute(real_relative_path))
+			throw new Error('Update path resolves outside its root.');
+	}
+}
+
 async function collect_files(dir, out = []) {
 	const entries = await fsp.readdir(dir, { withFileTypes: true });
 	for await (const entry of entries) {
@@ -135,10 +202,19 @@ async function is_file_locked(file) {
 		log('Update directory: %s', update_dir);
 	
 		if (await file_exists(update_dir)) {
+			const update_stats = await fsp.lstat(update_dir);
+			if (!update_stats.isDirectory() || update_stats.isSymbolicLink())
+				throw new Error('Update path is not a safe directory.');
+			await assert_update_path_contained(install_dir, update_dir);
+
 			const update_files = await collect_files(update_dir);
 			for (const file of update_files) {
-				const relative_path = path.relative(update_dir, file);
-				const write_path = path.join(install_dir, relative_path);
+				const relative_path = path.relative(update_dir, file).split(path.sep).join('/');
+				const source_path = resolve_update_path(update_dir, relative_path);
+				const write_path = resolve_update_path(install_dir, relative_path);
+
+				await assert_update_path_contained(update_dir, source_path);
+				await assert_update_path_contained(install_dir, write_path);
 	
 				log('Applying update file %s', write_path);
 	
@@ -156,8 +232,11 @@ async function is_file_locked(file) {
 						locked = await is_file_locked(write_path);
 					}
 	
+					await assert_update_path_contained(update_dir, source_path);
+					await assert_update_path_contained(install_dir, write_path);
 					await fsp.mkdir(path.dirname(write_path), { recursive: true });
-					await fsp.copyFile(file, write_path).catch(err => {
+					await assert_update_path_contained(install_dir, write_path);
+					await fsp.copyFile(source_path, write_path).catch(err => {
 						log('WARN: Failed to write update file due to system error: %s', err.message);
 					});
 				} catch (e) {
