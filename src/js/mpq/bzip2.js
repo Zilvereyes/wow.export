@@ -784,58 +784,26 @@ class BZip2InputStream {
 }
 
 function bzip2_decompress(compressed_data, expected_length) {
+	if (!Number.isSafeInteger(expected_length) || expected_length <= 0)
+		throw new Error('Bzip2 decompression requires a positive output limit');
+
 	const input_stream = new BufferInputStream(compressed_data);
 	const decompressor = new BZip2InputStream(input_stream);
-
-	const output_chunks = [];
+	const output = new Uint8Array(expected_length);
 	let total_length = 0;
 
-	const chunk_size = expected_length ? Math.min(expected_length, 65536) : 65536;
-
-	while (true) {
-		const chunk = new Uint8Array(chunk_size);
-		let bytes_read = 0;
-
-		// Read into chunk
-		for (let i = 0; i < chunk_size; i++) {
-			const byte = decompressor.readByte();
-			if (byte === -1)
-				break;
-
-			chunk[i] = byte;
-			bytes_read++;
-		}
-
-		if (bytes_read === 0)
+	while (total_length < expected_length) {
+		const byte = decompressor.readByte();
+		if (byte === -1)
 			break;
 
-		if (bytes_read === chunk_size) {
-			output_chunks.push(chunk);
-		} else {
-			output_chunks.push(chunk.slice(0, bytes_read));
-		}
-
-		total_length += bytes_read;
-
-		if (bytes_read < chunk_size)
-			break;
+		output[total_length++] = byte;
 	}
 
-	if (output_chunks.length === 0)
-		return new Uint8Array(0);
+	if (total_length === expected_length && decompressor.readByte() !== -1)
+		throw new Error(`Bzip2 output exceeds ${expected_length} bytes`);
 
-	if (output_chunks.length === 1)
-		return output_chunks[0];
-
-	const result = new Uint8Array(total_length);
-	let offset = 0;
-
-	for (const chunk of output_chunks) {
-		result.set(chunk, offset);
-		offset += chunk.length;
-	}
-
-	return result;
+	return output.subarray(0, total_length);
 }
 
 module.exports = {
