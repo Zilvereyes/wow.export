@@ -12,6 +12,32 @@ const DXT3 = 0x2;
 const DXT5 = 0x4;
 
 const BLP_MAGIC = 0x32504c42;
+const MAX_BLP_DIMENSION = 8192;
+const MAX_BLP_PIXELS = 4096 * 4096;
+const BYTES_PER_PIXEL = 4;
+const MAX_BLP_DECODED_BYTES = MAX_BLP_PIXELS * BYTES_PER_PIXEL;
+const MAX_BLP_TOTAL_DECODED_BYTES = 96 * 1024 * 1024;
+const SUPPORTED_ENCODINGS = new Set([1, 2, 3]);
+const SUPPORTED_ALPHA_DEPTHS = new Set([0, 1, 4, 8]);
+
+/**
+ * Multiply positive integers without exceeding a resource budget.
+ * @param {number[]} values
+ * @param {number} limit
+ * @param {string} description
+ * @returns {number}
+ */
+const checkedProduct = (values, limit, description) => {
+	let product = 1;
+	for (const value of values) {
+		if (!Number.isSafeInteger(value) || value < 1 || product > Math.floor(limit / value))
+			throw new Error(`${description} exceeds the BLP conversion limit.`);
+
+		product *= value;
+	}
+
+	return product;
+};
 
 /**
  * Unpack a colour value.
@@ -63,17 +89,11 @@ class BLPImage {
 		// Read file dimensions..
 		this.width = this.data.readUInt32LE();
 		this.height = this.data.readUInt32LE();
+		this._validateFormat();
 
 		// Read mipmap data..
 		this.mapOffsets = this.data.readUInt32LE(16);
 		this.mapSizes = this.data.readUInt32LE(16);
-
-		// Calculate available mipmaps..
-		this.mapCount = 0;
-		for (let ofs of this.mapOffsets) {
-			if (ofs !== 0)
-				this.mapCount++;
-		}
 
 		// Read colour palette..
 		this.palette = [];
@@ -82,7 +102,107 @@ class BLPImage {
 				this.palette[i] = this.data.readUInt8(4);
 		}
 
+		this._validateMipmaps(this.data.offset);
+
 		this.dataURL = null;
+	}
+
+	/**
+	 * Validate fields that determine conversion memory and work.
+	 * @private
+	 */
+	_validateFormat() {
+		if (!SUPPORTED_ENCODINGS.has(this.encoding))
+			throw new Error('Unsupported BLP encoding: ' + this.encoding);
+
+		if (!SUPPORTED_ALPHA_DEPTHS.has(this.alphaDepth))
+			throw new Error('Unsupported BLP alpha depth: ' + this.alphaDepth);
+
+		if (this.width === 0 || this.height === 0)
+			throw new Error(`Invalid BLP dimensions: ${this.width} x ${this.height}.`);
+
+		if (this.width > MAX_BLP_DIMENSION || this.height > MAX_BLP_DIMENSION)
+			throw new Error(`BLP dimensions exceed the conversion limit: ${this.width} x ${this.height}.`);
+
+		checkedProduct([this.width, this.height], MAX_BLP_PIXELS, 'BLP pixel count');
+		checkedProduct([this.width, this.height, BYTES_PER_PIXEL], MAX_BLP_DECODED_BYTES, 'BLP decoded byte count');
+	}
+
+	/**
+	 * Return the exact encoded byte count for a mipmap.
+	 * @param {number} width
+	 * @param {number} height
+	 * @returns {number}
+	 * @private
+	 */
+	_getExpectedMipmapSize(width, height) {
+		const pixelCount = checkedProduct([width, height], MAX_BLP_PIXELS, 'BLP mipmap pixel count');
+
+		switch (this.encoding) {
+			case 1:
+				return pixelCount + Math.ceil(pixelCount * this.alphaDepth / 8);
+
+			case 2: {
+				const blockBytes = this.alphaDepth > 1 ? 16 : 8;
+				return Math.ceil(width / 4) * Math.ceil(height / 4) * blockBytes;
+			}
+
+			case 3:
+				return checkedProduct([pixelCount, BYTES_PER_PIXEL], MAX_BLP_DECODED_BYTES, 'BLP mipmap byte count');
+		}
+	}
+
+	/**
+	 * Validate mipmap count, ranges, encoded sizes, and cumulative decode work.
+	 * @param {number} dataStart
+	 * @private
+	 */
+	_validateMipmaps(dataStart) {
+		const maxMipmaps = Math.floor(Math.log2(Math.max(this.width, this.height))) + 1;
+		const ranges = [];
+		let foundGap = false;
+		let totalDecodedBytes = 0;
+		this.mapCount = 0;
+
+		for (let i = 0; i < this.mapOffsets.length; i++) {
+			const offset = this.mapOffsets[i];
+			const size = this.mapSizes[i];
+			const present = offset !== 0 || size !== 0;
+
+			if (!present) {
+				foundGap = true;
+				continue;
+			}
+
+			if (offset === 0 || size === 0 || foundGap || i >= maxMipmaps)
+				throw new Error(`Invalid BLP mipmap table entry at index ${i}.`);
+
+			const scale = Math.pow(2, i);
+			const width = Math.max(1, Math.floor(this.width / scale));
+			const height = Math.max(1, Math.floor(this.height / scale));
+			const decodedBytes = checkedProduct([width, height, BYTES_PER_PIXEL], MAX_BLP_DECODED_BYTES, 'BLP mipmap decoded byte count');
+
+			if (totalDecodedBytes > MAX_BLP_TOTAL_DECODED_BYTES - decodedBytes)
+				throw new Error('BLP mipmaps exceed the cumulative conversion limit.');
+			totalDecodedBytes += decodedBytes;
+
+			const expectedSize = this._getExpectedMipmapSize(width, height);
+			if (size !== expectedSize)
+				throw new Error(`Invalid BLP mipmap size at index ${i}: expected ${expectedSize}, received ${size}.`);
+
+			if (offset < dataStart || offset > this.data.byteLength - size)
+				throw new Error(`Invalid BLP mipmap range at index ${i}.`);
+
+			const end = offset + size;
+			if (ranges.some(range => offset < range.end && end > range.start))
+				throw new Error(`Overlapping BLP mipmap range at index ${i}.`);
+
+			ranges.push({ start: offset, end });
+			this.mapCount++;
+		}
+
+		if (this.mapCount === 0)
+			throw new Error('BLP file does not contain a mipmap.');
 	}
 
 	/**
@@ -207,9 +327,9 @@ class BLPImage {
 		this.scaledHeight = Math.max(1, Math.floor(this.height / this.scale));
 		this.scaledLength = this.scaledWidth * this.scaledHeight;
 
-		// Extract the raw data we need..
-		this.data.seek(this.mapOffsets[mipmap]);
-		this.rawData = this.data.readUInt8(this.mapSizes[mipmap]);
+		// Extract a bounded view of the validated mipmap without expanding it into a number array..
+		const offset = this.mapOffsets[mipmap];
+		this.rawData = this.data.raw.subarray(offset, offset + this.mapSizes[mipmap]);
 	}
 
 	/**
