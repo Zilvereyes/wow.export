@@ -12,6 +12,7 @@ const generics = require('../generics');
 const core = require('../core');
 const BufferWrapper = require('../buffer');
 const mmap = require('../mmap');
+const { assertCASCKey, resolveCachePath } = require('./cache-path');
 
 let cacheIntegrity;
 
@@ -36,11 +37,13 @@ class BuildCache {
 	 * @param {string} key 
 	 */
 	constructor(key) {
+		assertCASCKey(key, 'build cache key');
+
 		this.key = key;
 		this.meta = {};
 
-		this.cacheDir = path.join(constants.CACHE.DIR_BUILDS, key);
-		this.manifestPath = path.join(this.cacheDir, constants.CACHE.BUILD_MANIFEST);
+		this.cacheDir = resolveCachePath(constants.CACHE.DIR_BUILDS, key);
+		this.manifestPath = resolveCachePath(this.cacheDir, constants.CACHE.BUILD_MANIFEST);
 	}
 	
 	/**
@@ -106,7 +109,7 @@ class BuildCache {
 	 * @param {string} dir Optional override directory.
 	 */
 	getFilePath(file, dir) {
-		return path.join(dir || this.cacheDir, file);
+		return resolveCachePath(dir || this.cacheDir, file);
 	}
 
 	/**

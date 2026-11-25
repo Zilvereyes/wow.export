@@ -16,6 +16,7 @@ const listfile = require('./listfile');
 const BLTEReader = require('./blte-reader').BLTEReader;
 const BLTEStreamReader = require('./blte-stream-reader');
 const cdnResolver = require('./cdn-resolver');
+const { assertCASCKey } = require('./cache-path');
 
 const EMPTY_HASH = '00000000000000000000000000000000';
 
@@ -363,6 +364,7 @@ class CASCRemote extends CASC {
 	async loadArchives() {
 		// Download archive indexes.
 		const archiveKeys = this.cdnConfig.archives.split(' ');
+		archiveKeys.forEach(key => assertCASCKey(key, 'archive key'));
 		const archiveCount = archiveKeys.length;
 
 		log.timeLog();
@@ -399,6 +401,8 @@ class CASCRemote extends CASC {
 	 * @param {string} key 
 	 */
 	async parseArchiveIndex(key) {
+		assertCASCKey(key, 'archive key');
+
 		const fileName = key + '.index';
 
 		let data = await this.cache.getFile(fileName, constants.CACHE.DIR_INDEXES);
