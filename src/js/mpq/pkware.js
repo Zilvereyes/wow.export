@@ -94,8 +94,8 @@ class PKLibDecompress {
 				break; // eos
 
 			if (literal_len < 256) {
-				if (out_pos >= expectedSize) // copy literal bytes directly
-					break;
+				if (out_pos >= expectedSize)
+					throw new Error(`PKWare output exceeds ${expectedSize} bytes`);
 
 				output[out_pos++] = literal_len;
 			} else {
@@ -106,8 +106,11 @@ class PKLibDecompress {
 					break; // eos
 
 				const source_pos = out_pos - distance;
-				if (source_pos < 0 || out_pos + length > expectedSize)
-					break; // invalid back-reference
+				if (source_pos < 0)
+					throw new Error('invalid PKWare back-reference');
+
+				if (out_pos + length > expectedSize)
+					throw new Error(`PKWare output exceeds ${expectedSize} bytes`);
 
 				for (let i = 0; i < length; i++)
 					output[out_pos++] = output[source_pos + i];

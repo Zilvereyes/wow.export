@@ -296,9 +296,11 @@ function adjust_tree(newNode) {
 	}
 }
 
-function huffman_decomp(compressedData) {
+function huffman_decomp(compressedData, maximumLength) {
 	if (compressedData.length === 0)
 		throw new Error('empty compressed data');
+	if (!Number.isSafeInteger(maximumLength) || maximumLength <= 0)
+		throw new Error('Huffman decompression requires a positive output limit');
 
 	const comp_type = compressedData[0];
 	if (comp_type === 0)
@@ -312,7 +314,8 @@ function huffman_decomp(compressedData) {
 
 	const input = new BitStream(compressedData.slice(1));
 
-	const result = [];
+	const result = new Uint8Array(maximumLength);
+	let resultLength = 0;
 	let currentTail = tail;
 
 	while (true) {
@@ -321,20 +324,22 @@ function huffman_decomp(compressedData) {
 
 		if (decomp_value === 256)
 			break; // eos
+		if (resultLength >= maximumLength)
+			throw new Error(`Huffman output exceeds ${maximumLength} bytes`);
 
 		if (decomp_value === 257) {
 			const literalByte = input.readBits(8);
 			if (literalByte === -1)
 				throw new Error('unexpected end of file while reading literal byte');
 
-			result.push(literalByte);
+			result[resultLength++] = literalByte;
 			currentTail = insert_node(currentTail, literalByte);
 		} else {
-			result.push(decomp_value);
+			result[resultLength++] = decomp_value;
 		}
 	}
 
-	return new Uint8Array(result);
+	return result.subarray(0, resultLength);
 }
 
 module.exports = { huffman_decomp };
